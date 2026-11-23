@@ -1,3 +1,5 @@
+#from __future__ import absolute_import
+from __future__ import print_function
 import logging
 import math
 import os
@@ -5,11 +7,16 @@ import shutil
 import sys
 import collections
 import random
-from StringIO import StringIO
+import io as StringIO
 import re
 
-import maddm_run_interface
-
+try:
+    from .indirect import indirect_compat
+    from . import maddm_run_interface
+except ImportError:
+    from indirect import indirect_compat
+    import maddm_run_interface
+    
 # python routines from MadGraph
 import madgraph.iolibs.export_v4 as export_v4
 import madgraph.iolibs.file_writers as writers
@@ -28,13 +35,13 @@ import madgraph.various.banner as bannermod
 from madgraph.core import base_objects
 
 
-class MYStringIO(StringIO):
+class MYStringIO(StringIO.StringIO):
     """one stringIO behaving like our dedicated writer for writelines"""
     def writelines(self, lines):
         if isinstance(lines, list):
-            return StringIO.writelines(self, '\n'.join(lines))
+            return StringIO.StringIO.writelines(self, '\n'.join(lines))
         else:
-            return StringIO.writelines(self, lines)
+            return StringIO.StringIO.writelines(self, lines)
         
 # Root path
 MDMDIR = os.path.dirname(os.path.realpath( __file__ ))
@@ -47,14 +54,12 @@ class MADDMProcCharacteristic(banner_mod.ProcCharacteristic):
     
     def default_setup(self):
         """initialize the directory to the default value""" 
-
         self.add_param('has_relic_density', False)
         self.add_param('relic_density_off', False)
         self.add_param('has_direct_detection', False)
-        self.add_param('has_directional_detection', False)
+        self.add_param('has_direct_electron', False)
         self.add_param('has_indirect_detection', False)
         self.add_param('has_indirect_spectral', False)
-        self.add_param('has_capture', False)
         self.add_param('dm_candidate', [0])
         self.add_param('coannihilator', [0])
         self.add_param('forbid_fast', False)
@@ -87,8 +92,10 @@ class ProcessExporterMadDM(export_v4.ProcessExporterFortranSA):
         super(ProcessExporterMadDM, self).__init__(dir_path, opt)
         self.resonances = set() 
         self.proc_characteristic = MADDMProcCharacteristic()
+        # MadGraph7 matrix elements take a flavour index: SMATRIX(P, FLAV_IDX, ANS)
+        self.smatrix_has_flav_idx = False
         
-    def convert_model(self, model, wanted_lorentz = [], wanted_couplings = []):
+    def convert_model(self, model, wanted_lorentz = [], wanted_couplings = [], **opts):
         """-----------------------------------------------------------------------#  
         #                                                                       #
         #  Create a full valid MG4 model from a MG5 model (coming from UFO)     #
@@ -107,7 +114,7 @@ class ProcessExporterMadDM(export_v4.ProcessExporterFortranSA):
         self.proc_characteristic['model'] = model.get('modelpath+restriction')
         
         out =  super(ProcessExporterMadDM, self).convert_model(model, 
-                                               wanted_lorentz, wanted_couplings)
+                                               wanted_lorentz, wanted_couplings, **opts)
         return out
 
     def write_procdef_mg5(self,*args,**opts):
@@ -169,13 +176,13 @@ class ProcessExporterMadDM(export_v4.ProcessExporterFortranSA):
 
         temp_dir = os.path.join(self.mgme_dir, 'Template')        
         # Add make_opts file in Source
-        print os.path.join(temp_dir, 'LO/Source', 'make_opts') #modified by antony
+        print(os.path.join(temp_dir, 'LO/Source', 'make_opts')) #modified by antony
         shutil.copy(os.path.join(temp_dir, 'LO/Source', 'make_opts'), #modified by antony
                     os.path.join(self.dir_path, 'Source'))        
  
         # Add the makefile 
         filename = os.path.join(self.dir_path,'Source','makefile')
-        self.write_source_makefile(writers.FortranWriter(filename))            
+        self.write_source_makefile(writers.FortranWriter(filename), model)
 
     def get_dd_type(self, process):
         orders = process.get('orders')
@@ -281,16 +288,17 @@ class ProcessExporterMadDM(export_v4.ProcessExporterFortranSA):
             self.proc_characteristic['has_relic_density'] = True
         if proc_id in [self.DD]:
             self.proc_characteristic['has_direct_detection'] = True
-            self.proc_characteristic['has_directional_detection'] = True
-            self.proc_characteristic['has_capture'] = True
 
         # Set lowercase/uppercase Fortran code
         writers.FortranWriter.downcase = False
 
-
+        # Extract the process information to name the subroutine
+        process_name = self.get_process_name(matrix_element, print_id=False)
         replace_dict = super(ProcessExporterMadDM,self).write_matrix_element_v4(
-                                            None, matrix_element, fortran_model)
+                                            None, matrix_element, fortran_model,
+                                            write=False, proc_prefix=process_name + '_')
 
+        replace_dict['proc_prefix'] = process_name + '_'
 
         # Extract the process information to name the subroutine
         process_name = self.get_process_name(matrix_element, print_id=False) 
@@ -302,10 +310,35 @@ class ProcessExporterMadDM(export_v4.ProcessExporterFortranSA):
         if replace_dict['nSplitOrders'] !='':
             file = file + '\n' + open(replace_dict['template_file2'])\
                                                             .read()%replace_dict
+        file = self.adapt_mg7_matrix_element(file, matrix_element)
         # Write the file
         writer.writelines(file)
 
         return replace_dict['return_value']
+    
+    def adapt_mg7_matrix_element(self, text, matrix_element):
+        """MadGraph7 standalone matrix elements differ from the MG5_aMC ones:
+          - the helper functions (BROKEN_SYM, GET_FLAVOR_INDEX, ...) include
+            'nexternal.inc', which exists only in the MG SubProcesses/P*
+            directories. MadDM writes all the matrix elements in one directory,
+            so the include is replaced by the NEXTERNAL parameter of the process;
+          - SMATRIX has a flavour index argument, SMATRIX(P, FLAV_IDX, ANS):
+            remember it to write the right calls in smatrix.f.
+        Nothing changes for the MG5_aMC matrix elements."""
+
+        if re.search(r"SUBROUTINE\s+\w*SMATRIX\s*\(\s*P\s*,\s*FLAV_IDX\s*,", text, re.I):
+            self.smatrix_has_flav_idx = True
+        nexternal = matrix_element.get_nexternal_ninitial()[0]
+        return re.sub(r"^\s*include\s+['\"]nexternal\.inc['\"]\s*$",
+                      "      INTEGER NEXTERNAL\n      PARAMETER (NEXTERNAL=%d)" % nexternal,
+                      text, flags=re.I | re.M)
+
+    def smatrix_call(self, process_name):
+        """Fortran call of the SMATRIX of one process. MadDM disables the MG7
+        flavour grouping (one flavour per matrix element), so FLAV_IDX = 1."""
+        if self.smatrix_has_flav_idx:
+            return ' call %s_smatrix(p_ext, 1, smatrix)' % process_name
+        return ' call %s_smatrix(p_ext, smatrix)' % process_name
     
     def add_resonances(self, matrix_element, fortran_model):
         """keep track of all the s-channel resonances in DM DM > SM SM"""
@@ -812,7 +845,7 @@ class ProcessExporterMadDM(export_v4.ProcessExporterFortranSA):
             tag = p.get('id')
             ids = self.make_ids(p, flag)
             if tag == flag:
-                info = ' call %s_smatrix(p_ext,smatrix)' % p.shell_string(print_id=False)
+                info = self.smatrix_call(p.shell_string(print_id=False))
                 smatrix[ids].append(info)
 
         maxintype = 0 
@@ -842,7 +875,7 @@ class ProcessExporterMadDM(export_v4.ProcessExporterFortranSA):
                 continue
             if self.get_dd_type(p)[0] != efttype:
                 continue
-            info = ' call %s_smatrix(p_ext, smatrix)' % self.get_process_name(me, print_id=False)
+            info = self.smatrix_call(self.get_process_name(me, print_id=False))
             output.append('if (k.eq.%s) then \n %s \n' % ( len(output)+1, info)) 
         
         return '%s \n %s' % (' else'.join(output), ' endif' if output else '')
@@ -896,7 +929,7 @@ class ProcessExporterMadDM(export_v4.ProcessExporterFortranSA):
         makefile_lines = makefile_template.readlines()
         for line in makefile_lines:
             if __flag in line:
-                new_line = '\t-cd src/ && make '+suffix
+                new_line = '\t$(MAKE) -C src '+suffix
                 new_line = new_line + '\n'
                 makefile.write(new_line)
             else:
@@ -952,17 +985,18 @@ class ProcessExporterMadDM(export_v4.ProcessExporterFortranSA):
 
     #-----------------------------------------------------------------------#   
     def WriteMassDirectDetection(self):
-        """Adding the light quark mass definition in direct_detection.f"""
-        
-        writer = open(pjoin(self.dir_path, 'src', 'direct_detection.f'), 'w')
-        
-        to_replace = {'quark_masses':[]}
+        """Adding the quark and electron mass definitions in direct_detection_RAPIDD.f"""
+
+        writer = open(pjoin(self.dir_path, 'src', 'direct_detection_RAPIDD.f'), 'w')
+        to_replace = {'quark_masses':[], 'electron_mass':[]}
         for pdg in range(1,7):
             p = self.model.get_particle(pdg)
             to_replace['quark_masses'].append('M(%s) = %s' % (pdg, p.get('mass')))
         to_replace['quark_masses'] = '\n           '.join(to_replace['quark_masses'])
+        p = self.model.get_particle(11)
+        to_replace['electron_mass'] = 'M_e = %s' % (p.get('mass'))
+        writer.write(open(pjoin(MDMDIR, 'python_templates', 'direct_detection_RAPIDD.f')).read() % to_replace)
         
-        writer.write(open(pjoin(MDMDIR, 'python_templates', 'direct_detection.f')).read() % to_replace)
         
 
 class Indirect_Reweight(rwgt_interface.ReweightInterface):
@@ -1007,7 +1041,23 @@ class Indirect_Reweight(rwgt_interface.ReweightInterface):
     def create_standalone_directory(self, *args, **opts):
         if self.shuffling_mode == 'shuffle':
             return
+        indirect_compat.require_reweight_build_tools()
         return super(Indirect_Reweight, self).create_standalone_directory(*args, **opts)
+
+    def load_interface_model(self, *args, **opts):
+        path, data, interface = super(Indirect_Reweight, self).load_interface_model(*args, **opts)
+        # Existing LHE banners may contain `add process direct_detection`
+        # alongside the generated annihilation matrix elements.
+        data['processes'] = [process for process in data['processes']
+                             if not indirect_compat.is_maddm_process_shortcut(process)]
+        if not data['processes']:
+            raise self.InvalidCmd('No matrix-element processes in the indirect event banner. '
+                                  'Regenerate the MadDM output and relaunch.')
+        return path, data, interface
+
+    def compile_SubProcess_dir(self, directory):
+        with indirect_compat.reweight_build_environment():
+            return super(Indirect_Reweight, self).compile_SubProcess_dir(directory)
     
     @staticmethod
     def maddm_get_sqrts(m, ve):
@@ -1033,7 +1083,7 @@ class Indirect_Reweight(rwgt_interface.ReweightInterface):
         return super(Indirect_Reweight, self).do_change(line)
 
 
-class ProcessExporterIndirectD(object):
+class ProcessExporterIndirectD:
     """_________________________________________________________________________#
     #                                                                         #
     #  This class is used to export the matrix elements generated from        #
@@ -1068,7 +1118,7 @@ class ProcessExporterIndirectD(object):
         new_history = self.modify_history(history)
         
         super(ProcessExporterIndirectD, self).finalize(matrix_elements, new_history, mg5options, flaglist)
-        
+
         path = pjoin(self.dir_path, 'Cards', 'param_card.dat')
         if os.path.exists(pjoin('..','..', 'Cards', 'param_card.dat')):
             try:
@@ -1080,7 +1130,7 @@ class ProcessExporterIndirectD(object):
                      cwd=os.path.dirname(path))   
         
         filename = os.path.join(self.dir_path, 'Cards', 'me5_configuration.txt')
-        self.cmd.do_save('options %s' % filename.replace(' ', '\ '), check=False,
+        self.cmd.do_save('options %s' % filename.replace(' ', r'\ '), check=False,
                          to_keep={'mg5_path':MG5DIR})
         
         self.write_procdef_mg5( pjoin(self.dir_path, 'SubProcesses', \
@@ -1101,18 +1151,32 @@ class ProcessExporterIndirectD(object):
 
     def modify_banner(self):
         """enforce that <init> in events.lhe have id 52 for both beam (ensure that py8 accepts it)"""
-        
-        all_lines = open(pjoin(self.dir_path,'bin','internal','banner.py')).readlines()
-        
-        for i, line in enumerate(all_lines):
-            if 'def get_idbmup(lpp):' in line:
-                break
+        path = pjoin(self.dir_path, 'bin', 'internal', 'banner.py')
+        all_lines = open(path).readlines()
 
-        next_line = all_lines[i+1] 
+        # Match signature regardless of args (lpp / self, lpp, beam=1)
+        for i, line in enumerate(all_lines):
+            if re.match(r'\s*def get_idbmup\(', line):
+                break
+        else:
+            logger.warning('get_idbmup not found in banner.py: DM ID 52 not enforced')
+            return
+
+        # Find last line of docstring (single- or multi-line)
+        j = i + 1
+        body = all_lines[j].strip()
+        if body.startswith(('"""', "'''")):
+            quote = body[:3]
+            if not (len(body) > 3 and body.endswith(quote)):
+                j += 1
+                while quote not in all_lines[j]:
+                    j += 1
+
+        next_line = all_lines[i+1]
         nb_space = next_line.find(next_line.strip())
-        all_lines.insert(i+2, '%sreturn 52 #enforce DM ID for pythia8\n' % (' '*nb_space))
-        
-        open(pjoin(self.dir_path,'bin','internal','banner.py'),'w').writelines(all_lines)
+        all_lines.insert(j+1, '%sreturn 52 #enforce DM ID for pythia8\n' % (' '*nb_space))
+
+        open(path, 'w').writelines(all_lines)
         
     def modify_history(self, history):
         """modify history to make an proc_card_mg5 more similar to the real process
@@ -1123,7 +1187,9 @@ class ProcessExporterIndirectD(object):
         indirect_done = False
 
         for line in history:
-            line = re.sub('\s+', ' ', line)
+            line = re.sub(r'\s+', ' ', line)
+            if line.startswith('add process ') and indirect_compat.is_maddm_process_shortcut(line[12:]):
+                line = 'add ' + line[12:]
         
             if line.startswith(('define darkmatter', 'define benchmark','define coannihilator')):
                 continue
@@ -1239,7 +1305,7 @@ class ProcessExporterIndirectD(object):
              
              
     def convert_model(self, model, wanted_lorentz = [],
-                             wanted_couplings = []):
+                             wanted_couplings = [], **opts):
         """ Create a full valid MG4 model from a MG5 model (coming from UFO)"""
 
         # make sure that mass/width external parameter without assoicated particle
@@ -1252,10 +1318,20 @@ class ProcessExporterIndirectD(object):
                     self.model['parameters'][('external',)].remove(param)
                     param = base_objects.ModelVariable(param.name, str(param.value), 'real')
                     self.model['parameters'][tuple()].append(param)
-        
-        
-        super(ProcessExporterIndirectD, self).convert_model(model, 
-                                                wanted_lorentz, wanted_couplings)
+
+
+        if self.opt['export_format'] == 'plugin':
+            # Indirect_* is a MadEvent output: let UFO_model_to_mg4 write the
+            # MadEvent version of Source/MODEL (vector.inc, maxparticles.inc, ...)
+            self.opt['export_format'] = 'madevent'
+            try:
+                super(ProcessExporterIndirectD, self).convert_model(model,
+                                                wanted_lorentz, wanted_couplings, **opts)
+            finally:
+                self.opt['export_format'] = 'plugin'
+        else:
+            super(ProcessExporterIndirectD, self).convert_model(model,
+                                                wanted_lorentz, wanted_couplings, **opts)
 
 
     #===========================================================================

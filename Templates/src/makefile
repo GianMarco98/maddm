@@ -1,4 +1,15 @@
 include ../Source/make_opts
+
+# macOS only: set linker sysroot if not already provided
+ifeq ($(shell uname -s),Darwin)
+  ifeq ($(SDKROOT),)
+    SDK_PATH := $(shell xcrun --show-sdk-path 2>/dev/null)
+    ifneq ($(SDK_PATH),)
+      LDFLAGS += -Wl,-syslibroot,$(SDK_PATH)
+    endif
+  endif
+endif
+
 prog = maddm
 fort= $(FC)
 
@@ -9,13 +20,10 @@ flags = $(FFLAGS) -L$(libdir) -I$(incdir)
 
 libs = -lmatrix_elements -ldhelas -lmodel
 
-objs_all=init.o integrate.o interpolate.o maddm.o phasespace.o relic_canon.o relic_coupled.o relic_density.o direct_detection.o directional_detection.o indirect_detect_2to2.o tests.o capture_rate.o alfas_functions.o
+objs_all=init.o integrate.o interpolate.o maddm.o phasespace.o relic_canon.o relic_coupled.o relic_density.o indirect_detect_2to2.o tests.o alfas_functions.o direct_detection_RAPIDD.o
 
 #Dependencies
 maddm.x: $(incdir)/maddm.inc $(incdir)/maddm_card.inc
-direct_detection.o: $(incdir)/maddm.inc $(incdir)/maddm_card.inc
-directional_detection.o: $(incdir)/maddm.inc $(incdir)/maddm_card.inc
-capture_rate.o: $(incdir)/maddm.inc $(incdir)/capturerate_models.inc
 tests.o: $(incdir)/maddm.inc $(incdir)/maddm_card.inc
 maddm.o: $(incdir)/maddm.inc $(incdir)/maddm_card.inc
 
@@ -29,10 +37,13 @@ clean:
 	-rm -f ../$(prog).x
 
 maddm: $(objs_all)
-	$(fort) $(flags) $(objs_all) $(libs) -o $(prog).x
+	$(fort) $(flags) $(objs_all) $(libs) $(LDFLAGS) -o $(prog).x
 
 relic_density: $(objs_all)
-	$(fort) $(flags) $(objs_all) $(libs) -o $(prog).x
+	$(fort) $(flags) $(objs_all) $(libs) $(LDFLAGS) -o $(prog).x
 
 direct_detection: $(objs_all)
-	$(fort) $(flags) $(objs_all) $(libs) -o $(prog).x
+	$(fort) $(flags) $(objs_all) $(libs) $(LDFLAGS) -o $(prog).x
+
+# MadDM: recompile source objects when generated includes change.
+$(objs_all): $(wildcard $(incdir)/*.inc)
